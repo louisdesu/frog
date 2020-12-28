@@ -1,0 +1,175 @@
+---
+title: "Getting frog working with reticulate"
+author: "Marius Mather"
+date: "12/06/2020"
+output: html_document
+---
+
+gordon.mcdonald@sydney.edu.au
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+load("workspace_21-08-20.RData")
+```
+
+## Steps so far
+
+* Create a conda environment called `'frog'` from the `requirements.txt` file 
+  in the `helper-scripts` folder. This can be done using a terminal command:
+  
+```{bash}
+conda env create -f=requirements.txt -n frog
+```
+
+* Rename the `helper-scripts` folder containing the Python scripts to
+  `accelpy`: we will probably need to import functions from these scripts,
+  having a simpler name makes that easier.
+  - We will probably also rename some of the Python scripts to make
+    them easier to import from.
+* Create an empty file called `__init__.py` in the `accelpy` folder: having
+  this file in a folder means the folder is treated as a Python module,
+  and you can import scripts from it.
+* Rename `EDA-Artifact-Detection` to `eda_artifact.py` - again, this will
+  make it easier to import later
+* Write a `classify_noninteractive()` function in `eda_artifact.py` that 
+  carries out the same steps as the existing script, without asking for user input.
+  Instead, it takes as the required information as function arguments.
+  * Some minor tweaks to the Python scripts were required to get this working,
+    e.g. changing some of the syntax for importing other modules
+* Rename `EDA-Peak-Detection` to `eda_peak.py`
+* Write a `find_peaks_noninteractive()` function in `eda_peak.py` that
+  finds peaks in a dataset without waiting for user input.
+  
+Then, because I've been unable to get `reticulate` working correctly,
+we call the Python functions from R by passing the required inputs
+as command line arguments.
+
+### Calling the Python scripts as command line programs
+
+I've written two simple helper scripts to run the artifact and peak
+detection functions: `run_eda_artifact.py` and `run_eda_peaks.py`.
+These use the [argparse](https://docs.python.org/3/library/argparse.html)
+library for Python, allowing you to put together command line arguments
+with default values and some automatic documentation. You can
+run each script with a `--help` argument to see the arguments
+they are expecting, e.g. 
+
+```{bash}
+python run_eda_artifact.py --help
+```
+
+See below for a full example of how to run the scripts on the test
+files.
+  
+### Reticulate issues
+
+I've had issues getting reticulate to properly import the EDA scripts,
+so haven't been able to get this working via reticulate.
+
+If reticulate is working for you, then it should be possible to run
+the artifact and peak detection algorithms by
+
+* Importing the `eda_artifact` module, e.g. 
+  `reticulate::import("accelpy.eda_artifact", as="eda_artifact")`
+* Calling the `classify_noninteractive()` function from R,
+  passing all the required arguments to it, e.g.
+  `py$eda_artifact$classify_noninteractive("my_input.csv", "output.csv")`
+  
+**(these examples haven't been tested, may be wrong)**
+  
+This would allow you to skip the step below of running the scripts
+via `system2()`.
+  
+## Example of running the scripts via Python
+
+Now that we have helper scripts up to call the Python functions
+via command line arguments, we can put together our list of
+input files and desired output paths using R code (and any other arguments
+we want to change) and use `system2` to pass them to the Python
+scripts. The Python functions run and save their results as CSV
+files, at the specified output paths.
+
+First we need to make sure we're using the Python executable from
+the conda environment we set up (mine is called `"frog"`).
+
+```{r python_setup}
+library(reticulate)
+
+# Make sure we're using the right conda environment - get the path
+#   to the environment's Python
+python_bin <- reticulate::conda_python("py37")
+```
+
+### Prepare list of pre-processed channels for classification
+
+```{r}
+datafiles <- list.files("6m_datafiles", pattern = "*.csv",full.names = TRUE) %>%
+  as_tibble() %>%
+  rename(filepath_in = "value") %>%
+  mutate(channels = paste0(substring(filepath_in,14,17),"_",substring(filepath_in,36,39)))
+  
+dead_channels <- output %>%
+  mutate(phase = fct_relevel(phase,"play","sf","reunion")) %>%
+  group_by(participant,device) %>%
+  summarise(avg_conduc = mean(conduc)) %>%
+  filter(avg_conduc < 10 | avg_conduc > 60) %>%
+  ungroup() %>%
+  mutate(channels = paste0(participant,"_",device)) %>%
+  distinct(channels)
+
+clean_channels <- datafiles %>%
+  mutate(filepath_out = paste0("output/artefact-detection/",substring(filepath_in,14,17),
+                               "_",substring(filepath_in,36,39),"_artefacts.csv")) %>%
+  anti_join(dead_channels, by = "channels") %>%
+  select(1,3,2)
+```
+
+Then we can run the artifact and peak detection functions on all
+of our test files - we see the output that the Python scripts
+are printing so should be able to spot any errors (the `FutureWarning`
+is just a warning and not a big deal).
+
+```{r run_eda_example}
+# Run the artifact detection script on each file
+map2(clean_channels[[1]], clean_channels[[2]], function(input_path, output_path) {
+  system2(
+    python_bin,
+    args = c(
+      "run_eda_artifact.py",
+      input_path,
+      output_path,
+      # You can choose Binary, Multiclass or Both
+      "--classifier", "Multiclass"
+    ))
+})
+```
+
+### Revise filepaths for peak detection
+
+```{r}
+clean_channels2 <- clean_channels %>%
+  mutate(filepath_out = str_replace(filepath_out,"artefacts","peaks") %>%
+                        str_replace(.,"artefact-detection","peak-detection"))
+```
+
+```{r run_peak_example}
+# Run the artifact detection script on each file
+map2(clean_channels2[[1]], clean_channels2[[2]], function(input_path, output_path) {
+  system2(
+    python_bin,
+    args = c(
+      "run_eda_peaks.py",
+      input_path,
+      output_path,
+      # The following arguments are all at their default values,
+      #   so could be left out
+      "--threshold", 0.02,
+      "--offset", 1,  
+      "--max_rise_time", 4,
+      "--max_decay_time", 4
+    ))
+})
+```
+

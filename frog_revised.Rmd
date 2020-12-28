@@ -1,0 +1,377 @@
+---
+title: "Building `frog`: A pipe-friendly package to pre-process Electrodermal Activity (EDA) data"
+author: "Louis Klein"
+output: html_notebook
+---
+
+### Initialise document and load some packages
+
+```{r settings, message=FALSE, warning=FALSE, include=FALSE}
+library(easypackages)
+libraries("knitr","tidyverse","tsibble","lubridate","magrittr")
+
+knitr::opts_chunk$set(
+  autodep = TRUE, # analyse chunk dependencies by automatically detecting global variables
+  cache = TRUE, # cache code chunks so that recompute will only occur on change
+  cache.comments = FALSE, # changing comments will not invalidate the cache
+  message = FALSE, # discard messages
+  warning = FALSE # discard warnings
+  )
+
+# getOption("max.print")
+options(max.print = 10000)
+```
+
+### Design statement
+
+```{r}
+# the primary function is the package's namesake `frog()` and organises secondary worker functions
+output <- filepaths %>%
+  frog(
+    spawn(type = "e4") %>%
+    croak(map = m, butter = TRUE)
+)
+
+# optionally `frog()` can be wrapped into the `pond()` function which checks and debugs the pipeline
+output <- filepaths %>%
+  pond(features = "matrix.csv",report = FALSE,
+    lilypad(walk = FALSE, # control global settings within `lilypad()`
+      spawn(type = "shimmer") %>%
+      polliwog(map = m, hertz = c(5,8)) %>%
+      frog(peaks = TRUE, artifact = TRUE) %>% # need to be able to set the python scripts Hz
+      croak(ledalab = TRUE) # dominik bach's version optional; plotting?
+  )
+) %>%
+  summary()
+# polliwog -> croak, lilypad -> frog, frog -> py scripts, croak -> tonic processing? NHST?
+```
+
+### Create `pond()` which checks for irregularities in the files associated with the input vector and excludes them with notes
+
+```{r pond}
+pond <- function(paths,features) {
+  
+  # create output df to capture unsuitable datafiles and which features are missing
+  data <- data.frame(datafile = character(0), issue = character(0))
+
+  # read in each datafile
+  # it may be more efficient to set n_max = 2 but then event marker check breaks?
+  for (i in seq_along(paths)) {
+  temp <- read_tsv(paste0(paths[[i]]), skip = 1, skip_empty_rows = TRUE, col_names = TRUE)
+  temp <- temp[-1,]
+  
+    # check whether any necessary features are missing and add notes to df if so
+    for (k in seq_along(features)) {
+      if (!any(str_detect(names(temp),features[[k]]))) {
+        # likely more elegant way to str_extract with more complicated regex e.g., "(?<=\\/)(.*)"
+        data <- add_row(data, datafile = str_split(paths[[i]],"^(.*[\\/])")[[1]][2], 
+                              issue = paste0(features[[k]]," is missing"))
+      }
+    }
+    # check whether the event marker column contains sufficient information to build out phase data
+    if (!any(temp[,str_detect(names(temp),"Event")] > 1)) {
+        data <- add_row(data, datafile = str_split(paths[[i]],"^(.*[\\/])")[[1]][2], 
+                              issue = "Event marker cannot identify phase")
+    }
+  }
+  return(data)
+}
+```
+
+- ideally pond = TRUE will also be a setting in frog() that automatically excludes failures; can be optimised since each datafile is read-in in full for both spawn() and pond()
+
+### Testing `pond()`
+
+```{r}
+input_a <- dir("6m_datafiles", pattern = "\\.csv$", full.names = TRUE)
+
+# chose to remove 'range' and 'resistance' from features list to minimise data loss
+features_v <- c("Timestamp","Accel_LN_X","Accel_LN_Y","Accel_LN_Z","Skin_Conductance","Event_Marker")
+exclusions <- pond(input_a, features_v)
+
+# examine dimensionality of exclusions
+exclusions %>% 
+  group_by(issue) %>%
+  count(issue, sort = TRUE) %>%
+  View()
+
+# prepare vector of useable datafiles
+exclusions_df <- exclusions %>%
+  mutate(datafile = as.factor(datafile),
+         issue = as.factor(issue)) %>%
+  distinct(datafile)
+
+exclusions_v <- as.character(exclusions_df[,1])
+exclusions_v <- paste(exclusions_v, collapse = '|')
+
+# bug: the as_tibble() call seems to add dimensionality to pond_input
+pond_input <- as_tibble(input_a) %>% 
+  filter(!str_detect(input_a, exclusions_v))
+```
+
+### `frog()` is the primary function using `purr::map()` to apply the secondary function `spawn()` to a list of separate filepaths containing participant data
+
+```{r frog}
+frog <- function(paths) {
+  data <- vector("list", length(paths))
+  data <- map_dfr(paths, ~ spawn(.x) %>% 
+                  # files should be an optional set and return fullfile
+                  mutate(files = as.factor(paste0(substring(.x,14,17),"_",substring(.x,36,39))))) %>%
+                  mutate(participant = as.factor(substr(.$files,0,4)),
+                         timestamp = lubridate::as_datetime(as.double(.$timestamp)/1000),
+                         device = as.factor(substr(.$files,6,9))) %>%
+                  select(participant, device, timestamp, phase, phase_t, 
+                         exp_t, lag, conduc, resist, accel_x, accel_y, accel_z) %>%
+                  # if multiple devices per .csv tsibble will key incorrectly
+                  tsibble::as_tsibble(index = timestamp, key = participant) %>%
+                  mutate(phase = fct_relevel(phase,"play","sf","reunion"))
+  return(data)
+}
+```
+
+- need some way to `tryCatch()` files that will fail
+- should apply `frog()` in parallel on multicore machines as an optional setting
+
+### `spawn()` reads-in individual datafiles, cleans them, applies appropriate lables, and organises them so that they can be bound together into a single tibble by `frog()`
+
+```{r spawn}
+spawn <- function(paths) {
+
+  # shimmer datafiles are read-in skipping a line with \tsv encoding, preserving column names
+  temp <- read_tsv(paste0(paths), skip = 1, skip_empty_rows = TRUE, col_names = TRUE)
+  # all shimmer files will have the 2nd line contain unit information that needs to be dropped
+  temp <- temp[-1,]
+
+  # names are corrected regardless of order
+  names(temp)[str_detect(names(temp),"Timestamp")] <- "timestamp"
+  names(temp)[str_detect(names(temp),"Accel_LN_X")] <- "accel_x"
+  names(temp)[str_detect(names(temp),"Accel_LN_Y")] <- "accel_y"
+  names(temp)[str_detect(names(temp),"Accel_LN_Z")] <- "accel_z"
+  names(temp)[str_detect(names(temp),"Range")] <- "range"
+  names(temp)[str_detect(names(temp),"Conductance")] <- "conduc"
+  names(temp)[str_detect(names(temp),"Resistance")] <- "resist"
+  names(temp)[str_detect(names(temp),"Event")] <- "event"
+
+  # loop drops any NA columns regardless of placement
+  for (i in seq_along(names(temp))) {
+    if (is.na(temp[[i]][1]) == TRUE) {
+      temp <- temp[,-i]
+    }
+  }
+
+  temp$toggle <- as.logical(ifelse(temp$event > 1, TRUE, FALSE)) # create event marker column
+  toggle_v <- which(temp$toggle == TRUE) # create logical vector to index the phases
+
+  # loop to transform epoch time from timestamp into experiment time
+  temp$exp_t <- vector("numeric", length(temp$timestamp))
+  for (j in seq_along(temp$timestamp)) {
+    temp$exp_t[[j]] <- as.numeric(paste0(temp[j,1])) - as.numeric(first(temp$timestamp, order_by = NULL))
+  }
+
+### Create phase time-event labels ---------------------------------------------
+
+  # initialise output vectors
+  temp$phase <- vector("character", length(temp$timestamp))
+  temp$phase_t <- vector("numeric", length(temp$timestamp))
+  
+  # experimental windows should be an optional setting with defaults for sf_exp
+  for (k in seq_along(temp$timestamp)) {
+    if (between(k, (toggle_v[[1]]-1200), (toggle_v[[1]]-1))) {
+      temp$phase[[k]] <- "play"
+      temp$phase_t[[k]] <- length(which(temp$phase == "play"))*200
+    } else if (between(k, toggle_v[[1]], last(toggle_v))) {
+      temp$phase[[k]] <- "sf"
+      temp$phase_t[[k]] <- length(which(temp$phase == "sf"))*200
+    } else if (between(k, last(toggle_v), last(toggle_v)+600)) {
+      temp$phase[[k]] <- "reunion"
+      temp$phase_t[[k]] <- length(which(temp$phase == "reunion"))*200
+    } else {
+      temp$phase[[k]] <- NA
+    }
+  }
+
+### Reshape dataset for binding across dfs -------------------------------------
+  
+  temp <- temp %>%
+    mutate(
+      ms      = (row_number()-1)*200,
+      lag     = exp_t - ms,
+      phase   = as.factor(phase),
+      range   = as.integer(range),
+      conduc  = as.double(conduc),
+      resist  = as.double(resist),
+      accel_x = as.double(accel_x),
+      accel_y = as.double(accel_y),
+      accel_z = as.double(accel_z)
+      ) %>%
+    # drop_na() in effect removes all rows that are outside the sf_exp temporal boundaries
+    drop_na(phase)
+}
+```
+
+### Testing `frog()` with `spawn()`
+
+```{r}
+# input_b <- dir("datafiles/test", pattern = "\\.csv$", full.names = TRUE) # not sure what this does?
+
+output <- frog(pond_input[[1]]) # to be used with pond_input
+# average time for running on 624 files = 40 minutes
+
+# save output
+write.csv(output,
+          file.path(file.path(getwd(), 'output'),"6m_prepared.csv"),
+          row.names = FALSE)
+```
+
+### Construct `croak()` which resamples `conduc` and optionally performs a Butterworth high-pass filter
+
+```{r croak}
+croak <- function (data, map, hertz=NULL, butter=FALSE, walk=TRUE) {
+  
+  # initialise vectors for efficiency
+  trail <- vector("integer",length(map$rowid))
+  
+  result <- map
+  result$ts <- vector("list",length(map$rowid))
+  result$bw <- vector("list",length(map$rowid))
+  result$accel_x <- vector("list",length(map$rowid))
+  result$accel_y <- vector("list",length(map$rowid))
+  result$accel_z <- vector("list",length(map$rowid))
+  
+  hz_from <- hertz[[1]]
+  hz_to <- hertz[[2]]
+  
+  # conditionally initialise progress bar
+  if (walk == FALSE) {
+    pb <- progress::progress_bar$new(
+      format = "  croaking [:bar] :percent eta: :eta",
+      total = broman::myround(as.numeric(length(map$rowid)),1), clear = FALSE, width= 100
+    )
+  }
+  
+  # conditionally initialise butterworth filter
+  if (butter == TRUE) {
+    b_filter <- signal::butter(n=1,W=0.2,type="low",plane="z")
+    result$bw <- vector("list",length(map$rowid))
+  }
+
+  # primary loop to subset dataframe for processing
+  for (i in seq_along(map$rowid)) {
+    
+    trail <- map[i,]
+      
+    # generate log to keep track of loop
+    if (walk == FALSE) {
+      pb$tick()
+      Sys.sleep(1/as.numeric(length(map$rowid)))
+    }
+    
+    # subset for next steps
+    temp <- data %>% 
+      select("participant","timestamp","device","phase","conduc","accel_x","accel_y","accel_z") %>%
+      filter(participant == trail[["participant"]], 
+             device == trail[["device"]],
+             phase == trail[["phase"]])
+
+    # resample waveform
+    result$ts[[i]] <- seewave::resamp(temp$conduc,f=hz_from,g=hz_to,output="ts")
+    result$accel_x[[i]] <- seewave::resamp(temp$accel_x,f=hz_from,g=hz_to,output="ts")
+    result$accel_y[[i]] <- seewave::resamp(temp$accel_y,f=hz_from,g=hz_to,output="ts")
+    result$accel_z[[i]] <- seewave::resamp(temp$accel_z,f=hz_from,g=hz_to,output="ts")
+    result$timestamp[[i]] <- seewave::resamp(temp$timestamp,f=hz_from,g=hz_to,output="ts")
+    
+    if (butter == TRUE) {
+      result$bw[[i]] <- signal::filter(b_filter,result$ts[[i]])
+    }
+  }
+  return(result)
+}
+```
+
+### Performing `croak()` on the cleaned output from `frog()` and `spawn()`
+
+```{r}
+# create blank 'invocation map'
+n <- crossing(
+  participant = unique(output_clean$participant),
+  device = factor(levels = c("CD1C","CD2B")),
+  phase = factor(levels = c("play","sf","reunion"))
+) %>%
+  mutate_all(as.character) %>%
+  rowid_to_column() 
+
+# create invocation map from dataset
+m <- output_clean %>%
+  select(1:2,4) %>%
+  unique() %>%
+  rowid_to_column()
+
+output_filtered <- output_clean %>%
+  group_by(participant,device,phase) %>%
+  mutate(timestamp = as.numeric(timestamp)) %>%
+  croak(
+    data = ., 
+    map = m,
+    hertz = c(5,8),
+    butter = TRUE,
+    walk = FALSE
+  )
+```
+
+`croak()` needs to be adjusted so that one of the inputs takes all of the variables 
+that will be resampled (for e.g., c(conduc,accel_xyz)) to ensure that other continuous
+predictors are appropriately dimensioned
+
+```{r}
+myformat.POSIXct <- function(x, digits=0) {
+  x2 <- round(unclass(x), digits)
+  attributes(x2) <- attributes(x)
+  x <- as.POSIXlt(x2)
+  x$sec <- round(x$sec, digits)
+  format.POSIXlt(x, paste("%Y-%m-%d %H:%M:%OS",digits,sep=""))
+}
+
+# create a separate .csv file for each participant to pass to the py-scripts
+for (i in seq_along(unique(output_filtered$participant))) {
+  # initialise participant for `filter()` call
+  temp.px <- unique(output_filtered$participant)[i]
+  temp <- output_filtered %>%
+    filter(participant == temp.px) %>%
+    select(-rowid) %>% rowid_to_column() %>%
+    unnest(c(timestamp,ts,bw,accel_x,accel_y,accel_z)) %>%
+    mutate(datetime = lubridate::as_datetime(timestamp) %>%
+                      myformat.POSIXct(.,digits = 6),
+           timestamp = str_replace(timestamp,regex("\\."),"") %>%
+                       substr(.,1,15) %>%
+                       stringi::stri_sub_replace(.,14,13,replacement = ".")
+      )
+
+  # generate log to keep track of loop
+  print(paste0("Attempting to write ",temp.px))
+  # export to `.csv`
+  write_csv(temp,
+            file.path("/Users/louisklein/Dropbox/r-projects/EARLY-CBRC/output/pre-processed",
+                      paste0(temp.px,"_pre-processed.csv")))
+}
+```
+
+```{r}
+### Reattaching temporal markers to `croak()` output ---------------------------
+
+phase_fx_revised <- function (df) {lm(bw ~ accel_xyz, data = df)}
+
+output_filtered_trunc <- output_filtered %>%
+  filter(participant == 3125) %>%
+  unnest(c(ts,bw,accel_xyz)) %>%
+  select(2:7) %>%
+  mutate(phase_t = seq(from=125,length.out=length(ts),by=125)) %>%
+  nest() %>%
+  mutate(
+    mod_bw  = map(data, phase_fx_revised),
+    glance  = mod_bw %>% map(broom::glance),
+    rsq     = glance %>% map_dbl("r.squared"),
+    tidy    = mod_bw %>% map(broom::tidy)
+  )
+```
+
+

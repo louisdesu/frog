@@ -2,3 +2,14 @@
 .Rhistory
 .RData
 .Ruserdata
+*.RData
+*.png
+"Icon\r"
+manuscripts/
+miscellaneous/
+output/
+datafiles/
+deprecated/
+6m_datafiles/
+*__pycache__
+*.pyc

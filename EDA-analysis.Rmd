@@ -1,0 +1,1271 @@
+---
+title: "EDA Analysis Workbook"
+subtitle: "Sympathetic nervous system activity as measured through skin conductance as an index of infant responsiveness to arousal in the Face-to-face Still-face paradigm"
+author: "Louis Klein"
+output: html_notebook
+---
+
+### Initialise document and load some packages
+
+```{r settings, message=FALSE, warning=FALSE, include=FALSE}
+library(easypackages)
+suppressPackageStartupMessages(
+  libraries("knitr","tidyverse","tsibble","lubridate","magrittr","kableExtra",
+            "broom","broomExtra","ggpubr"
+            ))
+
+knitr::opts_chunk$set(
+  autodep = TRUE, # analyse chunk dependencies by automatically detecting global variables
+  cache = TRUE, # cache code chunks so that recompute will only occur on change
+  cache.comments = FALSE, # changing comments will not invalidate the cache
+  message = FALSE, # discard messages
+  warning = FALSE # discard warnings
+  )
+
+# getOption("max.print")
+options(max.print = 1000)
+
+### Load additional objects ----------------------------------------------------
+
+# load("6m_processed.RData") # if processing scratch
+load("workspace_29-10-20.RData")
+```
+
+### Prepare data for modelling
+
+```{r}
+# make list of dead channels
+dead_channels <- output %>%
+  mutate(phase = fct_relevel(phase,"play","sf","reunion")) %>%
+  group_by(participant) %>%
+  summarise(avg_conduc = mean(conduc)) %>%
+  filter(avg_conduc < 1 | avg_conduc > 120) %>%
+  distinct(participant)
+
+# exclude dead channels and collapse accelerometer columns
+output_filtered <- output %>%
+  group_by(participant, device, phase) %>%
+  anti_join(dead_channels, by = "participant") %>%
+  mutate(accel_xyz = abs(accel_x) + abs(accel_y) + abs(accel_z))
+
+### Randomise devices ----------------------------------------------------------
+
+library(permute)
+# randomly assign participants by device
+rand <- output_clean %>%
+  ungroup() %>%
+  select(participant, device) %>%
+  group_by(participant, device) %>%
+  unique()
+
+rand %<>%
+  group_by(participant) %>%
+  mutate(assign = sample(c(0,1), size = 1, replace = TRUE))
+
+rand <- rand[shuffle(rand),]
+rand$dup <- duplicated(rand[,c(1,3)])
+rand <- rand[-which(rand$dup),]
+rand %<>% select(1:2) %>% 
+  arrange(participant)
+```
+
+#### UPDATED 28-10-20: Inverting time-series by phase and centering final sample on 0
+
+```{r}
+output_prep <- output_filtered %>% 
+  mutate(phase_t = phase_t/-1000,
+         phase_t = rev(phase_t))
+output_prep$phase_t[output_prep$phase_t==-.2] <- 0
+
+recode_test <- output_filtered %>% group_by(phase) %>% summarize(max_t = max(phase_t))
+
+### Merge into final dataset ---------------------------------------------------
+
+# merge rand with `frog_lm` and delete rejected channels
+sf_phase <- output_prep %>%
+  # anti_join(rand, by = c("participant", "device")) %>%
+  ungroup() %>% group_by(participant, phase) %>%
+  nest()
+
+glimpse(sf_phase)
+```
+
+
+### Model conductance for each participant by phase with resistance and accel_xyz as covariates
+
+```{r}
+# simple multivariate linear modeling function
+phase_fx <- function (df) {
+  lm(conduc ~ phase_t + resist + accel_xyz, data = df)
+}
+
+# apply it to the data
+phase_models <- sf_phase %>%
+  mutate(
+    mod = map(data, phase_fx)
+  )
+
+# extract summary statistics
+intercept_extract <- phase_models %>%
+  mutate(
+    glance  = mod %>% map(broom::glance),
+    rsq     = glance %>% map_dbl("r.squared"),
+    tidy    = mod %>% map(broom::tidy),
+    intercept = tidy %>% map("estimate") %>% map(1)
+    # augment = mod %>% map(broom::augment) # basically returns `output`
+  )
+
+glimpse(intercept_extract$glance[[1]])
+# phase_models %>% unnest(tidy) # this is computationally quite expensive
+```
+
+### Extract the model for each participant by phase
+
+```{r}
+sf_px <- intercept_extract %>%
+  unnest(tidy) %>%
+  select(1:2,6:8) %>%
+  pivot_wider(names_from = term, values_from = estimate) %>%
+  rename(intercept = `(Intercept)`, slope = phase_t) %>%
+  drop_na()
+
+### Prepare dataset for NHST ---------------------------------------------------
+
+sf_px <- rowid_to_column(sf_px,"id") # add unique column id
+
+sf_px %<>%
+  mutate(participant = as.factor(participant),
+         id = as.factor(id),
+         intercept = as.numeric(intercept)) %>%
+  rstatix::reorder_levels("phase", order = c("play","sf","reunion"))
+
+levels(sf_px$phase)
+glimpse(sf_px)
+```
+
+### Let's interpret the models descriptively
+- might want to explore the Anderson-Darling test `nortest::ad.test()`
+
+```{r}
+# check for non-finite values
+any(sapply(sf_px,is.infinite))
+
+# check for NA values
+any(sapply(sf_px,is.na))
+
+# compute summary statistics
+sf_px %>%
+  ungroup() %>% group_by(phase) %>%
+  rstatix::get_summary_stats(c(intercept,slope), type = "mean_sd")
+
+# boxplot visualisation of summary
+sf_px %>%
+  filter(intercept > 0, intercept < 200) %>%
+  ggpubr::ggboxplot(x = "phase", y = "intercept")
+
+# identify outliers
+sf_px %>% 
+  ungroup() %>% group_by(phase) %>%
+  rstatix::identify_outliers(intercept)
+
+# visually check for outliers
+ggqqplot(sf_px, "intercept", facet.by = "phase")
+
+### Normality ------------------------------------------------------------------
+
+# Kolgomorov-Smirnov less sensitive to large sample size
+ks_fx <- function (df) {
+  temp <- df[[1]]
+  data <- ks.test(x = temp, y = 'pnorm', alternative = 'two.sided')
+  return(data)
+}
+
+sf_residuals <- phase_models %>%
+  mutate(
+    res = mod %>% map(stats::residuals),
+    norm = res %>% map(ks_fx),
+    ks = norm %>% map_dbl("p.value")
+  )
+```
+
+ - Shapiro-Wilkes test indicates non-normality for each phase-grouping, however this could be due to the relatively large sample size as Shapiro-Wilkes becomes highly sensitive to even minor deviations in normality as sample size becomes large
+ - for this reason, visual inspection of the QQ plot is preferred however we already have good reason to believe that normality assumptions may be violated from the naive boxplots by phase-grouping already conducted
+
+
+### Visualising the data
+
+```{r}
+### Build separate plots -------------------------------------------------------
+
+# linear models of conductance by play phase
+play_pl <- sf_px %>%
+  ungroup() %>%
+  filter(phase == "play") %>% {
+  ggplot(.) + theme_bw() + xlim(0,4) + ylim(0, 200) +
+  geom_abline(intercept = .$intercept, slope = .$slope, alpha = .$rsq/2.5) +
+  geom_hline(yintercept = mean(.$intercept), colour = "red", size = 1) +
+  geom_hline(yintercept = median(.$intercept), colour = "blue", size = 1) +
+  labs(x = "Free play", y = "Skin conductance (μS)")
+  }
+
+# linear models of conductance by play phase
+sf_pl <- sf_px %>%
+  ungroup() %>%
+  filter(phase == "sf") %>% {
+  ggplot(.) + theme_bw() + xlim(0,1.5) + ylim(0, 200) +
+  geom_abline(intercept = .$intercept, slope = .$slope, alpha = .$rsq/2.5) +
+  geom_hline(yintercept = mean(.$intercept), colour = "red", size = 1) +
+  geom_hline(yintercept = median(.$intercept), colour = "blue", size = 1) +
+  labs(x = "Still-face")
+  }
+
+# linear models of conductance by play phase
+reunion_pl <- sf_px %>%
+  ungroup() %>%
+  filter(phase == "reunion") %>% {
+  ggplot(.) + theme_bw() + xlim(0,2) + ylim(0, 200) +
+  geom_abline(intercept = .$intercept, slope = .$slope, alpha = .$rsq/2.5) +
+  geom_hline(yintercept = mean(.$intercept), colour = "red", size = 1) +
+  geom_hline(yintercept = median(.$intercept), colour = "blue", size = 1) +
+  labs(x = "Reunion")
+  }
+
+### Splice them together -------------------------------------------------------
+
+library(grid)
+library(egg)
+# Visualise differences by phase
+sf_figure <- ggarrange(
+  play_pl,
+  sf_pl +
+    theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()),
+  reunion_pl +
+    theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()),
+  widths = c(4,1.5,2),
+  nrow = 1)
+
+annotate_figure(sf_figure,
+  top = textGrob(
+    "Visualisation of linear models by participant by phase",
+    hjust = 1.72, x = 1
+  ),
+  bottom = textGrob(
+    "CBRC: Louis Klein, 15-07-20",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1.07, x = 1 # these right-justify the footnote
+  )
+)
+```
+
+### Hypothesis testing
+
+```{r}
+library(rstatix)
+# run mixed-ANOVA with repeated measures
+sf_px %>%
+  ungroup() %>%
+  filter(intercept > 0, intercept < 200) %>%
+  anova_test(dv = intercept, 
+             wid = participant, 
+             between = phase) %>%
+  get_anova_table() %>%
+  adjust_pvalue(method = "bonferroni")
+```
+
+
+
+```{r}
+artefact_filepaths <- list.files("output/artefact-detection", pattern = "*.csv",full.names = TRUE) %>%
+  as_tibble() %>%
+  rename(filepath_in = "value") %>%
+  mutate(channels = substring(filepath_in,27,35))
+
+peak_filepaths <- list.files("output/peak-detection", pattern = "*.csv",full.names = TRUE) %>%
+  as_tibble() %>%
+  rename(filepath_in = "value") %>%
+  mutate(channels = substring(filepath_in,23,31))
+
+# prepare output dataframe
+combined <- peak_filepaths[[2]] %>% 
+  as_tibble() %>%
+  rename(channels = value)
+```
+
+```{r}
+# helper function to produce epochs in peak data
+epochr <- function(value,base) {
+  base*floor(value/base)
+}
+
+phase_ts <- output_prep %>%
+  select(1:5) %>%
+  group_by(participant,device,phase) %>%
+  filter(phase_t == 0) %>%
+  mutate(
+    timestamp = as.numeric(as.POSIXct(timestamp)),
+    epoch_start = epochr(timestamp,5),
+    channels = paste0(participant,"_",device)
+    ) %>%
+  select(1:2,4:3,6:7) %>%
+  nest(phases = c(1:5)) %>%
+  semi_join(combined,by="channels") %>%
+  left_join(artefact_filepaths,by="channels") %>%
+  left_join(peak_filepaths,by="channels") %>%
+  mutate(analyses = NA)
+```
+
+```{r,results="hide"}
+for (i in seq_along(phase_ts[[1]])) {
+  library(lubridate)
+  artefacts <- read_csv(file.path(phase_ts[[3]][i])) %>%
+    mutate(epoch_start = epochr(time_length(interval(ymd("1970-01-01"), StartTime)),5),
+           epoch_end = epochr(time_length(interval(ymd("1970-01-01"), EndTime)),5)) %>%
+    select(1,6,4:5)
+  
+  peaks <- read_csv(file.path(phase_ts[[4]][i])) %>%
+    mutate(timestamp = as.numeric(time_length(interval(ymd("1970-01-01"),Timestamp)))) %>%
+    filter(EDA < 50) %>%
+    mutate(epoch_start = epochr(timestamp,5)) %>%
+    select(10:9,2:8)
+  
+  phase_ts[[5]][[i]] <- full_join(artefacts,peaks,by="epoch_start") %>%
+    arrange(epoch_start) %>%
+    as_tibble() %>%
+    nest(analyses = everything())
+}
+```
+
+```{r}
+phase_ts <- phase_ts %>% 
+  unnest(c(analyses)) %>%
+  mutate(master = NA)
+
+for (i in seq_along(phase_ts[[1]])) {
+  
+  temp_a <- phase_ts[[1]][i]
+  
+  temp_b <- phase_ts %>% 
+    filter(channels == temp_a) %>%
+    unnest(phases) %>%
+    select(1:6)
+  
+  # adding phase label to constrain end of experiment appropriately
+  temp_d <- temp_b[3,] %>%
+    mutate(phase = "terminated",
+           timestamp = timestamp+240,
+           epoch_start = epochr(timestamp,5))
+  temp_e <- rbind(temp_b,temp_d)
+  
+  temp_c <- phase_ts %>% 
+  filter(channels == temp_a) %>%
+  unnest(analyses) %>%
+  select(1,5:16)
+
+  phase_ts[[6]][[i]] <- full_join(temp_e,temp_c,by="epoch_start") %>% 
+    arrange(epoch_start) %>%
+    fill(1:4) %>%
+    select(2:4,8,6,9:18) %>%
+    rename(peak = timestamp.y) %>%
+    nest(clean = everything())
+}
+
+phase_ts <- phase_ts %>% 
+  unnest(c(master))
+```
+
+```{r}
+# how many peak events have been detected per phase by participant by device?
+phase_ts %>%
+  select(clean) %>%
+  unnest(clean) %>%
+  group_by(participant,device,phase) %>%
+  filter(phase!="terminated",!is.na(EDA),!is.na(participant)) %>%
+  rstatix::reorder_levels("phase", order = c("play","sf","reunion")) %>%
+  count(phase)
+
+# what is the average number of peak events by phase?
+phase_ts %>%
+  select(clean) %>%
+  unnest(clean) %>%
+  group_by(participant,device,phase) %>%
+  filter(phase!="terminated",!is.na(EDA),!is.na(participant)) %>%
+  count(phase) %>%
+  ungroup() %>% 
+  group_by(phase) %>%
+  rstatix::reorder_levels("phase", order = c("play","sf","reunion")) %>%
+  summarise(by_phase = mean(n))
+
+# what is the proportion of peak events by phase?
+phase_ts %>%
+  select(clean) %>%
+  unnest(clean) %>%
+  group_by(participant,device,phase) %>%
+  filter(phase!="terminated",!is.na(EDA),!is.na(participant)) %>%
+  rstatix::reorder_levels("phase", order = c("play","sf","reunion")) %>%
+  count(phase) %>%
+  mutate(N = case_when(phase == "play" | phase == "reunion" ~ n/240*100,
+                       phase == "sf" ~ n/90*100)) %>%
+  ungroup() %>%
+  group_by(phase) %>%
+  summarise(by_phase = mean(N))
+
+# which phase did children have the most artefacts in?
+phase_ts %>%
+  select(clean) %>%
+  unnest(clean) %>%
+  group_by(phase) %>%
+  filter(phase != "terminated",!is.na(MulticlassLabels),!is.na(participant)) %>%
+  rstatix::reorder_levels("phase", order = c("play","sf","reunion")) %>%
+  select(1:3,7) %>%
+  count(MulticlassLabels) %>%
+  mutate(phase_total = sum(n),
+         proportion = round(n/phase_total*100)) %>%
+  select(-4)
+```
+
+- peak frequencies -> Shriya
+- note on dependent variable
+- brief notes for methods section
+- add proportion of peaks by phase column
+- single .csv file
+
+```{r}
+shriya <- phase_ts %>%
+  select(clean) %>%
+  unnest(clean) %>%
+  group_by(participant,device,phase) %>%
+  filter(phase!="terminated",!is.na(EDA),!is.na(participant)) %>%
+  rstatix::reorder_levels("phase", order = c("play","sf","reunion")) %>%
+  count(phase) %>% 
+  mutate(N = case_when(phase == "play" | phase == "reunion" ~ n/240*100,
+                       phase == "sf" ~ n/90*100))
+
+write_csv(shriya,file.path(getwd(),"REAL_peaks_28-10-20.csv"))
+```
+
+```{r}
+shriya %>%
+  ggplot(aes(phase,N,fill=device)) +
+  geom_boxplot()
+```
+
+#### Revised data processing and simulation
+
+```{r}
+# 197 dead channels in total
+dead_channels <- output %>%
+  group_by(participant,device) %>%
+  select(1:2,8) %>%
+  mutate(avg_conduc = mean(conduc)) %>%
+  filter(avg_conduc < 10 | avg_conduc > 60) %>%
+  distinct(participant,device)
+
+# 119 participants affected
+dead_channels %>%
+  ungroup() %>%
+  select(participant) %>%
+  distinct()
+
+# exclude dead channels and collapse accelerometer columns
+output_clean <- output %>%
+  group_by(participant, device, phase) %>%
+  # anti_join(dead_channels, by = "participant") %>%
+  mutate(phase = fct_relevel(phase,"play","sf","reunion"),
+         accel_xyz = abs(accel_x) + abs(accel_y) + abs(accel_z))
+
+# 387 clean channels for 194 participants included
+# 193 infants with 2 channels; 1 with 1 channel
+output_clean %>%
+  ungroup() %>%
+  distinct(participant,device) %>%
+  count(participant) %>%
+  filter(n == 1)
+
+# Ottmar Lippe: Curtain University
+
+### Randomise devices ----------------------------------------------------------
+
+sim <- function (data) {
+  
+  # simple multivariate linear modeling function
+  phase_fx <- function (df) {lm(conduc ~ phase_t + accel_xyz, data = df)}
+  
+    # randomly assign participants by device
+    rand <- data %>%
+      ungroup() %>%
+      select(participant, device) %>%
+      group_by(participant, device) %>%
+      unique()
+    rand %<>% group_by(participant) %>% mutate(assign = sample(c(0,1), size = 1, replace = TRUE))
+    rand <- rand[permute::shuffle(rand),]
+    rand$dup <- duplicated(rand[,c(1,3)])
+    rand <- rand[-which(rand$dup),]
+    rand %<>% select(1:2) %>% arrange(participant)
+
+    # merge rand with `frog_lm` and delete rejected channels
+    temp <- data %>% 
+      anti_join(rand, by = c("participant", "device")) %>%
+      ungroup() %>% group_by(participant,device,phase) %>%
+      nest() %>%
+      mutate(
+        mod = map(data, phase_fx),
+        tidy = mod %>% map(broom::tidy),
+        intercept = tidy %>% map("estimate") %>% map(1),# this 'plucks' the intercept value
+        se = tidy %>% map("estimate") %>% map(2)
+      ) %>%
+      select(participant,device,phase,intercept,se)
+    
+  return(temp)
+}
+```
+
+```{r}
+channels_simulated <- replicate(10000,sim(output_prep),simplify = FALSE)
+```
+
+```{r}
+channels_simulated_clean <- channels_simulated %>%
+  imap(~mutate(.x, rep = .y)) %>%
+  map_df(as_tibble) %>%
+  group_by(participant,device,phase) %>%
+  mutate(
+    rep = as.factor(rep),
+    intercept = as.numeric(intercept),
+    se = as.numeric(se)
+  ) %>%
+  select(6,1:5) %>%
+  arrange(participant)
+
+# optionally remove outliers
+outliers <- sf_px %>% 
+  ungroup() %>% 
+  group_by(phase) %>%
+  rstatix::identify_outliers(intercept) %>%
+# filter(is.extreme == TRUE) %>% # titrate outlier extremity
+  select(participant, phase)
+
+channels_sim_outliers <- channels_simulated_clean %>%
+  ungroup() %>%
+  anti_join(outliers,
+            by=c("participant","phase"))
+
+# how many participants were removed?
+(dim(channels_simulated_clean)-dim(channels_sim_outliers))/10000
+
+# what is the difference in intercept average across replications by phase?
+channels_simulated_clean %>%
+  ungroup() %>%
+  filter(intercept > 0, intercept < 200) %>%
+  group_by(device,phase) %>%
+  summarise(intercept_average = mean(intercept),
+            se_average = mean(se))
+
+# does it matter that the phases are different lengths?
+channels_simulated_clean %>%
+  ungroup() %>%
+  filter(intercept > 0, intercept < 200) %>%
+  group_by(device,phase) %>%
+  summarise(intercept_average = mean(intercept),
+            se_average = mean(se)) %>%
+  mutate_at(vars(intercept_average,se_average),~case_when(phase == "play" ~ .,
+                                                          phase == "sf" ~ ./(190/240),
+                                                          phase == "reunion" ~ .))
+```
+fix this
+```{r}
+# what are the between-phase differences by device using the simulation data
+channels_simulated_clean %>%
+  pivot_wider(names_from = phase,values_from = c(intercept,se)) %>%
+  group_by(participant,device) %>%
+  summarise(play_sf = intercept_sf-intercept_play,
+            sf_reunion = intercept_reunion-intercept_sf) %>%
+  ungroup() %>% group_by(device) %>%
+  summarise(play_sf = mean(play_sf),
+            sf_reunion = mean(sf_reunion))
+```
+
+
+```{r}
+# what is the between-device difference in average intercept by participant by phase?
+channels_simulated_clean %>%
+  ungroup() %>%
+  select(2:6) %>%
+  filter(intercept > 0, intercept < 200) %>%
+  group_by(participant,device,phase) %>%
+  summarise(intercept_average = mean(intercept),
+            se_average = mean(se)) %>%
+  pivot_wider(names_from = device,
+              values_from = c(intercept_average,se_average)) %>%
+  mutate(intercept_difference = abs((intercept_average_CD1C-intercept_average_CD2B)),
+         se_difference = abs((se_average_CD1C-se_average_CD2B))) %>%
+  select(participant,phase,intercept_difference,se_difference)
+
+# what is overall between-device difference?
+channels_simulated_clean %>%
+  ungroup() %>%
+  select(2:6) %>%
+  filter(intercept > 0, intercept < 200) %>%
+  group_by(participant,device,phase) %>%
+  summarise(intercept_average = mean(intercept),
+            se_average = mean(se)) %>%
+  pivot_wider(names_from = device,
+              values_from = c(intercept_average,se_average)) %>%
+  mutate(intercept_difference = (intercept_average_CD1C-intercept_average_CD2B),
+         se_difference = (se_average_CD1C-se_average_CD2B)) %>%
+  select(participant,phase,intercept_difference,se_difference) %>%
+  ungroup() %>%
+  drop_na(intercept_difference,se_difference) %>%
+  group_by(phase) %>%
+  summarise(overall_difference = mean(intercept_difference),
+            overall_se = mean(se_difference))
+```
+
+```{r}
+y_title <- expression(
+  paste(
+    "Mean skin conductance (",
+    italic("μS"),
+    ")"
+  ))
+
+play_sim <- channels_sim_outliers %>%
+  ungroup() %>%
+  group_by(rep,phase) %>%
+  summarise(intercept = mean(intercept),
+            se = mean(se)) %>%
+  filter(phase == "play",intercept < 200) %>% {
+  ggplot(.) + theme_bw() + xlim(0,4) + ylim(0, 60) +
+  geom_abline(intercept = .$intercept, slope = 0, alpha = .006) +
+  geom_hline(yintercept = mean(.$intercept), colour = "red", size = 1) +
+  labs(x = "Free play", y = y_title)
+  }
+
+sf_sim <- channels_sim_outliers %>%
+  ungroup() %>%
+  group_by(rep,phase) %>%
+  summarise(intercept = mean(intercept),
+            se = mean(se)) %>%
+  filter(phase == "sf",intercept < 200) %>% {
+  ggplot(.) + theme_bw() + xlim(0,1.5) + ylim(0, 60) +
+  geom_abline(intercept = .$intercept, slope = 0, alpha = .006) +
+  geom_hline(yintercept = mean(.$intercept), colour = "red", size = 1) +
+  labs(x = "Still-face")
+  }
+
+reunion_sim <- channels_sim_outliers %>%
+  ungroup() %>%
+  group_by(rep,phase) %>%
+  summarise(intercept = mean(intercept),
+            se = mean(se)) %>%
+  filter(phase == "reunion",intercept < 200) %>% {
+  ggplot(.) + theme_bw() + xlim(0,2) + ylim(0, 60) +
+  geom_abline(intercept = .$intercept, slope = 0, alpha = .006) +
+  geom_hline(yintercept = mean(.$intercept), colour = "red", size = 1) +
+  labs(x = "Reunion")
+  }
+
+### Splice graphs together -----------------------------------------------------
+
+library(ggpubr)
+library(grid)
+library(egg)
+
+sf_figure <- ggarrange(
+  play_sim,
+  sf_sim +
+    theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()),
+  reunion_sim +
+    theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()),
+  widths = c(4,1.5,2),
+  nrow = 1)
+
+main_title <- expression(
+  paste(
+    "Simulation of mean conductance intercepts by participant by phase (",
+    italic("n"),
+    "=10000)"
+  ))
+
+annotate_figure(sf_figure,
+  top = textGrob(
+    main_title,
+    hjust = 1.3, x = 1.09
+  ),
+  bottom = textGrob(
+    "CBRC: Louis Klein, 29-10-20",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1.07, x = 1
+  )
+)
+```
+
+
+```{r}
+load("~/Dropbox/r-projects/EARLY-CBRC/workspace_14-07-20.RData")
+
+exclusions %>% 
+  mutate(participant = substr(datafile,1,4),
+         channel = substr(datafile,23,26)) %>%
+  mutate_at(vars(participant,channel),~as.factor(.)) %>%
+  count(issue) %>%
+  mutate(N = round(n/sum(n)*100))
+
+# there are 2 participants with only 1 channel affected out of 34
+exclusions %>% 
+  mutate(participant = substr(datafile,1,4),
+         channel = substr(datafile,23,26)) %>%
+  mutate_at(vars(participant,channel),~as.factor(.)) %>%
+  distinct(participant,channel) %>%
+  count(participant) %>%
+  count(n)
+```
+
+separate intercept for each phase, then the Value column is added to that
+
+applied a simple contrast on the measurement devices to 
+
+RESULTS
+
+CD1C produced measurements were on average .93 lower than the average measurement across both devices. Significant difference between skin conductance measurements on devices t(-91.07) at p<.001
+- unknown the extent to which the difference is driven by instrument or by the lateralisation of measurement, however even if it fully represents effect of lateralisation, it is not experimentally meaningful in this case
+
+Limitation
+- assuming skin conductance responding is linear in each phase, which may not be true
+- there is some evidence for a weak? violation of the assumption of linearity due to a non-linear component of the time effect that is not fully captured by the model (as evidenced by almost identical values in phase_t:phasesf and phase_t:phasereunion)
+
+
+Interaction is commutative so you can choose how to interpret it (although one is categorical other is continuous)
+in still face the effect of time is .034 larger than in the free play phase (because the total effect of time per phase is the effect of time in the reference phase i.e. free play, plus the time by still-face or time by reunion interactions)
+so what this means is that during the free play there is a very very slow increase i.e. zero over the course of the phase, then it increases at a slightly faster rate in sf and decreases by almost exactly the same rate, but the estimates that we end up with in the sf and the re
+
+```{r}
+nlme_prep <- output_prep %>%
+  ungroup() %>%
+  anti_join(outliers,
+            by=c("participant","phase")) %>%
+  group_by(participant,device,phase) %>%
+  filter(!participant %in% c(3360,3384,3536,3770,3838,3557,3568,3594)) 
+# drop px based on visual inspection
+
+### Make contrasts by device ---------------------------------------------------
+
+nlme_cont <- matrix(c(-.5,.5), ncol=1)
+contrasts(nlme_prep$device) <- nlme_cont
+
+### Mixed-effects modelling ----------------------------------------------------
+library(nlme)
+
+nlme_frog <- lme(conduc ~ 0 + phase_t*phase + accel_xyz + device,
+                 random = ~ phase_t*phase | participant,
+                 data = nlme_prep)
+
+summary(nlme_frog)
+
+library(lme4)
+
+lmer_frog <- lme(conduc ~ phase_t*phase + accel_xyz + (participant*phase|device) + (phase_t*phase|participant),
+                 data=nlme_prep)
+
+summary(lmer_frog)
+```
+
+report fixed effects table
+
+```{r}
+getVarCov(nlme_frog)
+```
+phase_t i.e. free play doesn't have a lot of variance which would suggest that there isn't a huge amount of difference between individuals
+we're seeing the between-subjects variance increase over successive phases, in line with the simulation
+and we also have some theoretical expectation that children may adopt different strategies in responding during the reunion but also sf
+
+```{r}
+anova(nlme_frog)
+```
+
+
+```{r}
+plot(resid(nlme_frog))
+qqnorm(resid(nlme_frog))
+```
+
+heavy tails, possibly non-linear dependencies
+
+```{r}
+nlme_fixed <- fixef(nlme_frog) %>% 
+  enframe() %>%
+  column_to_rownames(var = "name")
+
+nlme_fixed_play_intercept <- nlme_fixed[2,"value"]
+nlme_fixed_reunion_intercept <- nlme_fixed[3,"value"]
+nlme_fixed_sf_intercept <- nlme_fixed[4,"value"]
+
+nlme_fixed_play_slope <- nlme_fixed[1,"value"]
+nlme_fixed_reunion_slope <- nlme_fixed[7,"value"]
+nlme_fixed_sf_slope <- nlme_fixed[8,"value"]
+
+# confint(nlme_frog)
+nlme_fixed
+```
+
+plot of the observations across time by phase and then superimpose the model fit; could give a sense of whether or not the model fit is just really bad at one end of a phase etc.
+
+- actually plot by participant by phase
+add the ranef to the fixed-effects for each participant
+also plot the population-level fit as well
+
+- overall plot of fixed effects
+- plot raw data but no ranef summaries
+- intercepts for each phase hlines, with slopes for phase_t as lines per phase
+- looking for whether the data roughly follows those lines
+
+- plot ranef summaries for each participant
+the random slopes are all relative to the random intercept (below) then each of these random effects is then added to the relevant fixed effects
+3115 is a latent psychopath
+3125 is disorganised attachment with possible murderous intent
+
+
+```{r}
+play_nlme <- nlme_prep %>%
+  filter(phase=="play",device=="CD1C") %>%
+  ungroup() %>%
+  group_by(participant,device) %>%
+  mutate(samples_n=1:length(device)/240) %>%
+  ggplot(aes(x=samples_n,y=conduc,group=participant)) + 
+  theme_bw() + 
+  coord_cartesian(xlim=c(0,4),ylim=c(0,80)) + 
+  geom_line(alpha=.22) +
+  geom_abline(intercept=nlme_fixed_play_intercept,slope=nlme_fixed_play_slope,colour="red",size=1) +
+  labs(x="Free play",y=expression(paste("Skin conductance (",italic("μS"),")")))
+
+sf_nlme <- nlme_prep %>%
+  filter(phase=="sf",device=="CD1C") %>%
+  ungroup() %>%
+  group_by(participant,device) %>%
+  mutate(samples_n=1:length(device)/90) %>%
+  ggplot(aes(x=samples_n,y=conduc,group=participant)) + 
+  theme_bw() + 
+  coord_cartesian(xlim=c(0,1.5),ylim=c(0,80)) + 
+  geom_line(alpha=.22) +
+  geom_abline(intercept=nlme_fixed_sf_intercept,slope=nlme_fixed_sf_slope,colour="red",size=1) +
+  labs(x="Still-face")
+
+reunion_nlme <- nlme_prep %>%
+  filter(phase=="reunion",device=="CD1C") %>%
+  ungroup() %>%
+  group_by(participant,device) %>%
+  mutate(samples_n=1:length(device)/120) %>%
+  ggplot(aes(x=samples_n,y=conduc,group=participant)) + 
+  theme_bw() + 
+  coord_cartesian(xlim=c(0,2),ylim=c(0,80)) + 
+  geom_line(alpha=.22) +
+  geom_abline(intercept=nlme_fixed_reunion_intercept,slope=nlme_fixed_reunion_slope,colour="red",size=1) +
+  labs(x="Reunion")
+
+### Splice graphs together -----------------------------------------------------
+
+library(ggpubr)
+library(grid)
+library(egg)
+
+test <- ggarrange(
+  play_nlme,
+  sf_nlme +
+    theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()),
+  reunion_nlme +
+    theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()),
+  widths = c(4,1.5,2),
+  nrow = 1) %>%
+  annotate_figure(.,
+  top = textGrob(
+    expression(
+      paste("Plot of raw skin conductance signals by participant by phase for device 'CD2B' (",italic("n"),"=313)")),
+    hjust = 1.3, x = 1.21
+  ),
+  bottom = textGrob(
+    "CBRC: Louis Klein, 12-11-20",
+    gp = gpar(fontface = 3, fontsize = 9),
+    hjust = 1.07, x = 1
+  )
+)
+```
+
+```{r}
+nlme_ranef <- coef(nlme_frog) %>%
+  rownames_to_column() %>%
+  rename(participant = "rowname",play = "phaseplay",sf = "phasesf",reunion = "phasereunion") %>%
+  select(participant,play,sf,reunion) %>%
+  pivot_longer(!participant,names_to="phase",values_to="ranef")
+
+nlme_ranef_slopes <- coef(nlme_frog) %>%
+  rownames_to_column() %>%
+  rename(participant="rowname",play="phase_t",sf="phase_t:phasesf",reunion="phase_t:phasereunion") %>%
+  pivot_longer(!participant,names_to="phase",values_to="ranef") %>%
+  filter(!str_detect(phase,"phaseplay|phasesf|phasereunion|(Intercept)|accel_xyz|device1")) %>%
+  rename(slope=ranef)
+
+nlme_visu <- nlme_prep %>%
+  full_join(nlme_ranef,by=c("participant","phase")) %>%
+  full_join(nlme_prep,by=c("participant","device","timestamp","phase","phase_t",
+                           "exp_t","lag","conduc","resist","accel_x","accel_y","accel_z","accel_xyz")) %>%
+  arrange(participant,device,timestamp) %>%
+  full_join(nlme_ranef_slopes,by=c("participant","phase")) %>%
+  mutate(ranef = case_when(device=="CD2B"~ranef+-0.9333792,device=="CD1C"~ranef))
+```
+
+visual inspection shows problematic data in several participants still-face phase
+
+```{r}
+output_filtered %>% 
+  group_by(phase) %>% 
+  summarize(max_t = max(phase_t))
+
+bad_sf <- output_filtered %>% 
+  group_by(participant,device,phase) %>% 
+  summarize(max_t = max(phase_t)) %>%
+  filter(phase=="sf",max_t>450000) %>%
+  select(participant,device,phase)
+
+nlme_visu <- nlme_visu %>% 
+  anti_join(bad_sf,by = c("participant", "device", "phase"))
+
+glimpse(nlme_visu)
+```
+
+prepare for plot testing below
+
+```{r}
+# subset for testing
+nlme_test <- nlme_visu %>% filter(str_detect(participant,"3115|3158|3184|3254"))
+# unique(nlme_test$participant)
+```
+
+produce individual plots for each device with fixed and random effects indicated
+
+```{r}
+library(ggpubr)
+library(grid)
+library(egg)
+library(patchwork)
+
+# create custom theme for missing/removed data
+  theme_NA <- function (base_size = 11, base_family = "") {
+    theme_bw() %+replace% 
+    theme(
+      panel.grid.minor=element_blank(),
+      panel.grid.major=element_blank(),
+      panel.background=element_blank(),
+      panel.border=element_blank()
+    )}
+
+for (i in seq_along(unique(nlme_visu$participant))) {
+
+  temp_px <- unique(nlme_visu$participant)[i]
+  temp_df <- nlme_visu %>% filter(participant == temp_px)
+                     
+  ### Extract random effects ---------------------------------------------------
+
+  CD1C_play_intercept <- temp_df %>% filter(device=="CD1C",phase=="play") %>% pull(ranef) %>% first()
+  CD1C_play_slope <- temp_df %>% filter(device=="CD1C",phase=="play") %>% pull(slope) %>% first()
+  CD1C_sf_intercept <- temp_df %>% filter(device=="CD1C",phase=="sf") %>% pull(ranef) %>% first()
+  CD1C_sf_slope <- temp_df %>% filter(device=="CD1C",phase=="sf") %>% pull(slope) %>% first()
+  CD1C_reunion_intercept <- temp_df %>% filter(device=="CD1C",phase=="reunion") %>% pull(ranef) %>% first()
+  CD1C_reunion_slope <- temp_df %>% filter(device=="CD1C",phase=="reunion") %>% pull(slope) %>% first()
+  
+  CD2B_play_intercept <- temp_df %>% filter(device=="CD2B",phase=="play") %>% pull(ranef) %>% first()
+  CD2B_play_slope <- temp_df %>% filter(device=="CD2B",phase=="play") %>% pull(slope) %>% first()
+  CD2B_sf_intercept <- temp_df %>% filter(device=="CD2B",phase=="sf") %>% pull(ranef) %>% first()
+  CD2B_sf_slope <- temp_df %>% filter(device=="CD2B",phase=="sf") %>% pull(slope) %>% first()
+  CD2B_reunion_intercept <- temp_df %>% filter(device=="CD2B",phase=="reunion") %>% pull(ranef) %>% first()
+  CD2B_reunion_slope <- temp_df %>% filter(device=="CD2B",phase=="reunion") %>% pull(slope) %>% first()
+  # n.b. fixed effects are inherited from environment
+
+  ### Extract random effects ---------------------------------------------------
+
+  CD1C_play_temp <- temp_df %>%
+        filter(device=="CD1C",phase=="play") %>%
+        ungroup() %>% group_by(participant)
+  
+  CD1C_play_shader <- CD1C_play_temp %>%
+    ungroup() %>%
+    filter(conduc<1) %>%
+    pull(phase_t)
+  
+  if (all(rapportools::is.empty(CD1C_play_temp$conduc))==FALSE) {
+    CD1C_play_temp <- CD1C_play_temp %>%
+      ggplot(aes(x=phase_t,y=conduc,group=participant)) + 
+      theme_bw() + theme(axis.title.y=element_blank(),
+                         axis.text.x=element_blank(),
+                         axis.ticks.x=element_blank(),
+                         axis.title.x=element_blank(),
+                         plot.margin=margin(r=2,l=0,t=10,b=0)) + 
+      geom_line(alpha=.8,size=.2) +
+      geom_vline(xintercept=CD1C_play_shader,colour="grey92") +
+      coord_cartesian(ylim=c(0,80)) +
+      scale_x_continuous(expand=c(0,0)) + scale_y_continuous(expand=c(0,0)) +
+      geom_abline(intercept=nlme_fixed_play_intercept,slope=nlme_fixed_play_slope,colour="red",size=.3,alpha=.5) +
+      geom_abline(intercept=CD1C_play_intercept,slope=CD1C_play_slope,colour="blue",size=.3,alpha=.5)
+  } else {
+    CD1C_play_temp <- tibble(x=1,y=1) %>%
+      ggplot(aes(x,y)) + 
+      theme_NA() + theme(axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y=element_blank(),
+                         axis.text.x=element_blank(),
+                         axis.ticks.x=element_blank(),
+                         axis.title.x=element_blank(),
+                         plot.margin=margin(r=2,l=0,t=10,b=0))
+  }
+
+  CD2B_play_temp <- temp_df %>%
+    filter(device=="CD2B",phase=="play") %>%
+    ungroup() %>% group_by(participant)
+  
+  CD2B_play_shader <- CD2B_play_temp %>%
+    ungroup() %>%
+    filter(conduc<1) %>%
+    pull(phase_t)
+  
+  if (all(rapportools::is.empty(CD2B_play_temp$conduc))==FALSE) {
+    CD2B_play_temp <- CD2B_play_temp %>%
+      ggplot(aes(x=phase_t,y=conduc,group=participant)) + 
+      theme_bw() + theme(axis.title.y=element_blank(),
+                         plot.margin=margin(r=2,l=0,t=10,b=0)) + 
+      geom_line(alpha=.8,size=.2) +
+      geom_vline(xintercept=CD2B_play_shader,colour="grey92") +
+      coord_cartesian(ylim=c(0,80)) +
+      scale_x_continuous(expand=c(0,0)) + scale_y_continuous(expand=c(0,0)) +
+      geom_abline(intercept=nlme_fixed_play_intercept,slope=nlme_fixed_play_slope,colour="red",size=.3,alpha=.5) +
+      geom_abline(intercept=CD2B_play_intercept,slope=CD2B_play_slope,colour="blue",size=.3,alpha=.5) +
+      labs(x="Free play")
+  } else {
+    CD2B_play_temp <- tibble(x=1,y=1) %>%
+      ggplot(aes(x,y)) + 
+      theme_NA() + theme(axis.title.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.text.x=element_blank(),
+                         axis.ticks.x=element_blank(),
+                         plot.margin=margin(r=2,l=0,t=10,b=0)) + 
+      labs(x="Free play")
+  }
+
+  CD1C_sf_temp <- temp_df %>%
+    filter(device=="CD1C",phase=="sf") %>%
+    ungroup() %>% group_by(participant)
+  
+  CD1C_sf_shader <- CD1C_sf_temp %>%
+    ungroup() %>%
+    filter(conduc<1) %>%
+    pull(phase_t)
+  
+  if (all(rapportools::is.empty(CD1C_sf_temp$conduc))==FALSE) {
+    CD1C_sf_temp <- CD1C_sf_temp %>%
+      ggplot(aes(x=phase_t,y=conduc,group=participant)) + 
+      theme_bw() + theme(strip.background=element_blank(),
+                         strip.text.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y=element_blank(),
+                         axis.text.x=element_blank(),
+                         axis.ticks.x=element_blank(),
+                         axis.title.x=element_blank(),
+                         plot.margin=margin(r=2,l=2,t=10,b=0)) + 
+      geom_line(alpha=.8,size=.2) +
+      geom_vline(xintercept=CD1C_sf_shader,colour="grey92") +
+      coord_cartesian(ylim=c(0,80)) +
+      scale_x_continuous(expand=c(0,0)) + scale_y_continuous(expand=c(0,0)) +
+      geom_abline(intercept=nlme_fixed_sf_intercept,slope=nlme_fixed_sf_slope,colour="red",size=.3,alpha=.5) +
+      geom_abline(intercept=CD1C_sf_intercept,slope=CD1C_sf_slope,colour="blue",size=.3,alpha=.5)
+  } else {
+    CD1C_sf_temp <- tibble(x=1,y=1) %>%
+      ggplot(aes(x,y)) + 
+      theme_NA() + theme(strip.background=element_blank(),
+                         strip.text.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y=element_blank(),
+                         axis.text.x=element_blank(),
+                         axis.ticks.x=element_blank(),
+                         axis.title.x=element_blank(),
+                         plot.margin=margin(r=2,l=2,t=10,b=0))
+  }
+
+  CD2B_sf_temp <- temp_df %>%
+    filter(device=="CD2B",phase=="sf") %>%
+    ungroup() %>% group_by(participant)
+
+  CD2B_sf_shader <- CD2B_sf_temp %>%
+    ungroup() %>%
+    filter(conduc<1) %>%
+    pull(phase_t)
+  
+  if (all(rapportools::is.empty(CD2B_sf_temp$conduc))==FALSE) {
+    CD2B_sf_temp <- CD2B_sf_temp %>%
+      ggplot(aes(x=phase_t,y=conduc,group=participant)) + 
+      theme_bw() + theme(strip.background=element_blank(),
+                         strip.text.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y=element_blank(),
+                         plot.margin=margin(r=2,l=2,t=10,b=0)) + 
+      geom_line(alpha=.8,size=.2) +
+      geom_vline(xintercept=CD2B_sf_shader,colour="grey92") +
+      coord_cartesian(ylim=c(0,80)) +
+      scale_x_continuous(expand=c(0,0)) + scale_y_continuous(expand=c(0,0)) +
+      geom_abline(intercept=nlme_fixed_sf_intercept,slope=nlme_fixed_sf_slope,colour="red",size=.3,alpha=.5) +
+      geom_abline(intercept=CD2B_sf_intercept,slope=CD2B_sf_slope,colour="blue",size=.3,alpha=.5) +
+      labs(x="Still-face")
+  } else {
+    CD2B_sf_temp <- tibble(x=1,y=1) %>%
+      ggplot(aes(x,y)) + 
+      theme_NA() + theme(strip.background=element_blank(),
+                         strip.text.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y=element_blank(),
+                         axis.text.x=element_blank(),
+                         axis.ticks.x=element_blank(),
+                         plot.margin=margin(r=2,l=2,t=10,b=0)) +
+      labs(x="Still-face")
+  }
+
+  CD1C_reunion_temp <- temp_df %>%
+    filter(device=="CD1C",phase=="reunion") %>%
+    ungroup() %>% group_by(participant)
+  
+  CD1C_reunion_shader <- CD1C_reunion_temp %>%
+    ungroup() %>%
+    filter(conduc<1) %>%
+    pull(phase_t)
+  
+  if (all(rapportools::is.empty(CD1C_reunion_temp$conduc))==FALSE) {
+    CD1C_reunion_temp <- CD1C_reunion_temp %>%
+      ggplot(aes(x=phase_t,y=conduc,group=participant)) + 
+      theme_bw() + theme(strip.background=element_blank(),
+                         strip.text.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y.left=element_blank(),
+                         axis.text.x=element_blank(),
+                         axis.ticks.x=element_blank(),
+                         axis.title.x=element_blank(),
+                         plot.margin=margin(r=0,l=2,t=10,b=0)) + 
+      geom_line(alpha=.8,size=.2) +
+      geom_vline(xintercept=CD1C_reunion_shader,colour="grey92") +
+      coord_cartesian(ylim=c(0,80)) +
+      scale_x_continuous(expand=c(0,0)) + scale_y_continuous(expand=c(0,0),sec.axis=sec_axis(~.,name="CD1C")) +
+      geom_abline(intercept=nlme_fixed_reunion_intercept,slope=nlme_fixed_reunion_slope,colour="red",size=.3,alpha=.5) +
+      geom_abline(intercept=CD1C_reunion_intercept,slope=CD1C_reunion_slope,colour="blue",size=.3,alpha=.5)
+  } else {
+    CD1C_reunion_temp <- tibble(x=1,y=1) %>%
+      ggplot(aes(x,y)) + 
+      theme_NA() + theme(strip.background=element_blank(),
+                         strip.text.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y.left=element_blank(),
+                         axis.text.x=element_blank(),
+                         axis.ticks.x=element_blank(),
+                         axis.title.x=element_blank(),
+                         plot.margin=margin(r=0,l=2,t=10,b=0))
+  }
+
+  CD2B_reunion_temp <- temp_df %>%
+    filter(device=="CD2B",phase=="reunion") %>%
+    ungroup() %>% group_by(participant)
+  
+  CD2B_reunion_shader <- CD2B_reunion_temp %>%
+    ungroup() %>%
+    filter(conduc<1) %>%
+    pull(phase_t)
+  
+  if (all(rapportools::is.empty(CD2B_reunion_temp$conduc))==FALSE) {
+    CD2B_reunion_temp <- CD2B_reunion_temp %>%
+      ggplot(aes(x=phase_t,y=conduc,group=participant)) + 
+      theme_bw() + theme(strip.background=element_blank(),
+                         strip.text.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y.left=element_blank(),
+                         plot.margin=margin(r=0,l=2,t=10,b=0)) + 
+      geom_line(alpha=.8,size=.2) +
+      geom_vline(xintercept=CD2B_reunion_shader,colour="grey92") +
+      coord_cartesian(ylim=c(0,80)) +
+      scale_x_continuous(expand=c(0,0)) + scale_y_continuous(expand=c(0,0),sec.axis=sec_axis(~.,name="CD2B")) +
+      geom_abline(intercept=nlme_fixed_reunion_intercept,slope=nlme_fixed_reunion_slope,colour="red",size=.3,alpha=.5) +
+      geom_abline(intercept=CD2B_reunion_intercept,slope=CD2B_reunion_slope,colour="blue",size=.3,alpha=.5) +
+      labs(x="Reunion")
+  } else {
+    CD2B_reunion_temp <- tibble(x=1,y=1) %>%
+      ggplot(aes(x,y)) + 
+      theme_NA() + theme(strip.background=element_blank(),
+                         strip.text.y=element_blank(),
+                         axis.text.y=element_blank(),
+                         axis.ticks.y=element_blank(),
+                         axis.title.y.left=element_blank(),
+                         plot.margin=margin(r=0,l=2,t=10,b=0)) +
+      labs(x="Reunion")
+    # + geom_text(aes(label="NA",fontface="italic"))
+  }
+
+  CD1C_temp_plot <- CD1C_play_temp + CD1C_sf_temp + CD1C_reunion_temp + plot_layout(widths = c(4,1.5,2),nrow = 1)
+  CD2B_temp_plot <- CD2B_play_temp + CD2B_sf_temp + CD2B_reunion_temp + plot_layout(widths = c(4,1.5,2),nrow = 1)
+
+  temp_plot <- (CD1C_temp_plot/CD2B_temp_plot) + plot_annotation(
+    title=expression(paste("Skin conductance data for participant ",temp_px,".")),
+    subtitle="Dummy text",
+    caption=expression(paste(italic("CBRC"),": Louis Klein, 13-11-20"))
+  )
+
+  ggsave(filename=paste0(temp_px,"_ranef.png"))
+}
+```
+
+- detect when an element of each plot does not have available data, when unavailable add textgrob in its place
+- decrease plot margins between each phase vertically
+- increase plot margin between devices
+- relabel x-axes
+- potentially rescale x-axes so that the grids for each phase are proportionate
+- add title text indicating participant IDs
+- add notes section indicating fixed and random effect lines
+- add x-axis label minutes/seconds
+- constrain overall size of plots so that they don't open to fill the screen
+- add right y-axis title i.e. 'Shimmer Instrument ID'
+- add grey overlay to each plot to indicate NA regions
+
+n.b. if CD2B data is missing, the textgrob still needs a label as the CD1C data may still be plotted
+
+```{r}
+phase_empty_test <- nlme_test %>% 
+  filter(participant=="3158",device=="CD2B",phase=="play") %>% 
+  ungroup() %>% group_by(participant)
+
+phase_empty_test %>%
+  ungroup() %>%
+  filter(conduc<.1) %>%
+  select(phase_t) %>%
+  transmute(shader = paste0("geom_vline(xintercept=",phase_t,",colour=\"grey95\")"))
+```
+
+
+
+
+
+
+
+
+
+
+
