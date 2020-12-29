@@ -13,3 +13,4 @@ deprecated/
 6m_datafiles/
 *__pycache__
 *.pyc
+*.html
